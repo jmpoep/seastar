@@ -73,13 +73,14 @@
 module;
 #endif
 
-#include <cassert>
 #include <concepts>
 #include <unordered_set>
 #include <iostream>
 #include <optional>
 #include <memory_resource>
 #include <thread>
+
+#include <seastar/util/assert.hh>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -93,7 +94,6 @@ module;
 #include <cstdint>
 #include <algorithm>
 #include <limits>
-#include <cassert>
 #include <atomic>
 #include <mutex>
 #include <functional>
@@ -101,10 +101,9 @@ module;
 #include <utility>
 #include <boost/intrusive/list.hpp>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/mempolicy.h>
 
-#ifdef SEASTAR_HAVE_NUMA
-#include <numaif.h>
-#endif
 #endif // !defined(SEASTAR_DEFAULT_ALLOCATOR)
 
 #ifdef SEASTAR_MODULE
@@ -129,7 +128,7 @@ module seastar;
 #endif
 
 #ifdef SEASTAR_DEBUG
-#define dassert(expr) assert(expr)
+#define dassert(expr) SEASTAR_ASSERT(expr)
 #else
 #define dassert(expr) do {} while(false)
 #endif
@@ -146,7 +145,7 @@ void* internal::allocate_aligned_buffer_impl(size_t size, size_t align) {
     } else if (r == EINVAL) {
         throw std::runtime_error(format("Invalid alignment of {:d}; allocating {:d} bytes", align, size));
     } else {
-        assert(r == 0);
+        SEASTAR_ASSERT(r == 0);
         return ret;
     }
 }
@@ -346,8 +345,8 @@ static char* mem_base() {
         ::munmap(known + mem_base_alloc, cr + 2 * mem_base_alloc - (known + mem_base_alloc));
         // extremely unlikely for mmap to return a mapping at 0, but our detection of free(null)
         // depends on it not doing that so check it
-        assert(known != nullptr);
-        assert(reinterpret_cast<uintptr_t>(known) != 0);
+        SEASTAR_ASSERT(known != nullptr);
+        SEASTAR_ASSERT(reinterpret_cast<uintptr_t>(known) != 0);
     });
     return known;
 }
@@ -713,7 +712,7 @@ cpu_pages::link(page_list& list, page* span) {
 }
 
 void cpu_pages::free_span_no_merge(uint32_t span_start, uint32_t nr_pages) {
-    assert(nr_pages);
+    SEASTAR_ASSERT(nr_pages);
     nr_free_pages += nr_pages;
     auto span = &pages[span_start];
     auto span_end = &pages[span_start + nr_pages - 1];
@@ -1170,7 +1169,7 @@ cpu_pages::do_foreign_free(void* ptr) {
 }
 
 void cpu_pages::shrink(void* ptr, size_t new_size) {
-    assert(object_cpu_id(ptr) == cpu_id);
+    SEASTAR_ASSERT(object_cpu_id(ptr) == cpu_id);
     page* span = to_page(ptr);
     if (span->pool) {
         return;
@@ -1214,7 +1213,7 @@ bool cpu_pages::initialize() {
     cpu_id = cpu_id_gen.fetch_add(1, std::memory_order_relaxed);
     local_expected_cpu_id = (static_cast<uint64_t>(cpu_id) << cpu_id_shift)
 	        | reinterpret_cast<uintptr_t>(mem_base());
-    assert(cpu_id < max_cpus);
+    SEASTAR_ASSERT(cpu_id < max_cpus);
     all_cpus[cpu_id] = this;
     auto base = mem_base() + (size_t(cpu_id) << cpu_id_shift);
     auto size = 32 << 20;  // Small size for bootstrap
@@ -1361,7 +1360,7 @@ void cpu_pages::schedule_reclaim() {
 }
 
 memory::memory_layout cpu_pages::memory_layout() {
-    assert(is_initialized());
+    SEASTAR_ASSERT(is_initialized());
     return {
         reinterpret_cast<uintptr_t>(memory),
         reinterpret_cast<uintptr_t>(memory) + nr_pages * page_size
@@ -1832,6 +1831,23 @@ void configure_minimal() {
     init_cpu_mem();
 }
 
+static long mbind(void *addr,
+                  unsigned long len,
+                  int mode,
+                  const unsigned long *nodemask,
+                  unsigned long maxnode,
+                  unsigned flags) {
+    return syscall(
+        SYS_mbind,
+        addr,
+        len,
+        mode,
+        nodemask,
+        maxnode,
+        flags
+    );
+}
+
 internal::numa_layout
 configure(std::vector<resource::memory> m, bool mbind,
         bool transparent_hugepages,
@@ -1865,13 +1881,13 @@ configure(std::vector<resource::memory> m, bool mbind,
         get_cpu_mem().replace_memory_backing(sys_alloc);
     }
     get_cpu_mem().resize(total, sys_alloc);
-#ifdef SEASTAR_HAVE_NUMA
     size_t pos = 0;
     for (auto&& x : m) {
         unsigned long nodemask = 1UL << x.nodeid;
         if (mbind) {
             auto start = get_cpu_mem().mem() + pos;
-            auto r = ::mbind(start, x.bytes,
+            auto r = seastar::memory::mbind(
+                            start, x.bytes,
                             MPOL_PREFERRED,
                             &nodemask, std::numeric_limits<unsigned long>::digits,
                             MPOL_MF_MOVE);
@@ -1890,7 +1906,6 @@ configure(std::vector<resource::memory> m, bool mbind,
         }
         pos += x.bytes;
     }
-#endif
     return ret_layout;
 }
 
@@ -2244,7 +2259,7 @@ void* calloc(size_t nmemb, size_t size) {
         return nullptr;
     }
     auto s1 = __int128(nmemb) * __int128(size);
-    assert(s1 == size_t(s1));
+    SEASTAR_ASSERT(s1 == size_t(s1));
     size_t s = s1;
     auto p = malloc(s);
     if (p) {

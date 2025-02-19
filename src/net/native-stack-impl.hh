@@ -23,11 +23,23 @@
 
 #include <seastar/net/stack.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/log.hh>
 
 namespace seastar {
 
 extern logger seastar_logger;
+
+namespace internal {
+
+namespace native_stack_net_stats {
+
+inline thread_local std::array<uint64_t, max_scheduling_groups()> bytes_sent = {};
+inline thread_local std::array<uint64_t, max_scheduling_groups()> bytes_received = {};
+
+};
+
+}
 
 namespace net {
 
@@ -120,10 +132,10 @@ public:
 
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
         //TODO: implement SCTP
-        assert(proto == transport::TCP);
+        SEASTAR_ASSERT(proto == transport::TCP);
 
         // FIXME: local is ignored since native stack does not support multiple IPs yet
-        assert(sa.as_posix_sockaddr().sa_family == AF_INET);
+        SEASTAR_ASSERT(sa.as_posix_sockaddr().sa_family == AF_INET);
 
         _conn = make_lw_shared<typename Protocol::connection>(_proto.connect(sa));
         return _conn->connected().then([conn = _conn]() mutable {
@@ -172,6 +184,8 @@ public:
         }
         return _conn->wait_for_data().then([this] {
             _buf = _conn->read();
+            auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+            internal::native_stack_net_stats::bytes_received[sg_id] += _buf.len();
             _cur_frag = 0;
             _eof = !_buf.len();
             return get();
@@ -193,6 +207,8 @@ public:
         : _conn(std::move(conn)) {}
     using data_sink_impl::put;
     virtual future<> put(packet p) override {
+        auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+        internal::native_stack_net_stats::bytes_sent[sg_id] += p.len();
         return _conn->send(std::move(p));
     }
     virtual future<> close() override {

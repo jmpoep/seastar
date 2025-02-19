@@ -26,6 +26,7 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/http/client.hh>
 #include <seastar/http/url.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/closeable.hh>
@@ -939,6 +940,69 @@ SEASTAR_TEST_CASE(test_client_response_eof) {
     });
 }
 
+SEASTAR_TEST_CASE(test_client_retry_nested) {
+    return seastar::async([] {
+        loopback_connection_factory lcf(1);
+        auto ss = lcf.get_server_socket();
+        future<> server = ss.accept().then([] (accept_result ar) {
+            return seastar::async([sk = std::move(ar.connection)] () mutable {
+                input_stream<char> in = sk.input();
+                    read_simple_http_request(in);
+                    output_stream<char> out = sk.output();
+                    sstring r200("HTTP/1.1 200 OK\r\nHost: localhost\r\n\r\n");
+                    out.write(r200).get(); // now write complete response
+                    out.flush().get();
+                    out.close().get();
+            });
+        }).then([&ss] {
+            return ss.accept().then([] (accept_result ar) {
+                return seastar::async([sk = std::move(ar.connection)] () mutable {
+                    input_stream<char> in = sk.input();
+                    read_simple_http_request(in);
+                    output_stream<char> out = sk.output();
+                    sstring r200("HTTP/1.1 200 OK\r\nHost: localhost\r\n\r\n");
+                    out.write(r200).get(); // now write complete response
+                    out.flush().get();
+                    out.close().get();
+                });
+            });
+        });
+
+        future<> client_ex = seastar::async([&lcf] {
+            auto cln = http::experimental::client(std::make_unique<loopback_http_factory>(lcf), 2, http::experimental::client::retry_requests::yes);
+            auto req = http::request::make("GET", "test", "/test");
+            size_t count = 0;
+            BOOST_REQUIRE_EXCEPTION(cln.make_request(
+                                           std::move(req),
+                                           [&count](const http::reply&, input_stream<char>&&) {
+                                               ++count;
+                                               try {
+                                                   try {
+                                                       try {
+                                                           throw std::system_error(EPIPE, std::system_category());
+                                                       } catch (...) {
+                                                           std::throw_with_nested(std::runtime_error("Some exception"));
+                                                       }
+                                                   } catch (...) {
+                                                       std::throw_with_nested(std::system_error(ENOBUFS, std::system_category()));
+                                                   }
+                                               } catch (...) {
+                                                   return make_exception_future(std::current_exception());
+                                               }
+                                           },
+                                           http::reply::status_type::ok)
+                                        .get(),
+                                    std::system_error,
+                                    [](auto& ex) { return ex.code().value() == ENOBUFS; });
+
+            cln.close().get();
+            BOOST_REQUIRE_EQUAL(count, 2);
+        });
+
+        when_all(std::move(client_ex), std::move(server)).discard_result().get();
+    });
+}
+
 SEASTAR_TEST_CASE(test_client_response_parse_error) {
     return seastar::async([] {
         loopback_connection_factory lcf(1);
@@ -974,7 +1038,7 @@ SEASTAR_TEST_CASE(test_client_abort_new_conn) {
     class delayed_factory : public http::experimental::connection_factory {
     public:
         virtual future<connected_socket> make(abort_source* as) override {
-            assert(as != nullptr);
+            SEASTAR_ASSERT(as != nullptr);
             return sleep_abortable(std::chrono::seconds(1), *as).then([] {
                 return make_exception_future<connected_socket>(std::runtime_error("Shouldn't happen"));
             });
