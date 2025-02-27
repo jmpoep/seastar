@@ -123,6 +123,11 @@ namespace seastar {
 
 namespace internal {
 
+[[noreturn]] void assert_fail(const char* msg, const char* file, int line, const char* func) {
+    printf("%s:%u: %s: Assertion `%s` failed.\n", file, line, func, msg);
+    __builtin_trap();
+}
+
 void log_buf::free_buffer() noexcept {
     if (_own_buf) {
         delete[] _begin;
@@ -152,7 +157,7 @@ void log_buf::realloc_buffer_and_append(char c) noexcept {
     _alloc_failure = true;
     std::string_view msg = "(log buffer allocation failure)";
     auto can_copy = std::min(msg.size(), size_t(_current - _begin));
-    std::memcpy(_current - can_copy, msg.begin(), can_copy);
+    std::memcpy(_current - can_copy, msg.data(), can_copy);
   }
 }
 

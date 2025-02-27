@@ -23,7 +23,6 @@
 module;
 #endif
 
-#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -39,6 +38,7 @@ module;
 #include <netinet/tcp.h>
 #include <netinet/sctp.h>
 #include <sys/socket.h>
+#include <seastar/util/assert.hh>
 
 #ifdef SEASTAR_MODULE
 module seastar;
@@ -80,6 +80,9 @@ copy_reinterpret_cast(const void* ptr) {
     std::memcpy(&tmp, ptr, sizeof(T));
     return tmp;
 }
+
+thread_local std::array<uint64_t, seastar::max_scheduling_groups()> bytes_sent = {};
+thread_local std::array<uint64_t, seastar::max_scheduling_groups()> bytes_received = {};
 
 }
 
@@ -184,7 +187,7 @@ public:
 class posix_unix_stream_connected_socket_operations : public posix_connected_socket_operations {
 public:
     virtual void set_nodelay(file_desc& fd, bool nodelay) const override {
-        assert(nodelay); // make sure nobody actually tries to use this non-existing functionality
+        SEASTAR_ASSERT(nodelay); // make sure nobody actually tries to use this non-existing functionality
     }
     virtual bool get_nodelay(file_desc& fd) const override {
         return true;
@@ -570,7 +573,7 @@ future<accept_result> posix_ap_server_socket_impl::accept() {
     } else {
         try {
             auto i = sockets.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple());
-            assert(i.second);
+            SEASTAR_ASSERT(i.second);
             return i.first->second.get_future();
         } catch (...) {
             return make_exception_future<accept_result>(std::current_exception());
@@ -637,6 +640,8 @@ posix_data_source_impl::get() {
             _config.buffer_size /= 2;
             _config.buffer_size = std::max(_config.buffer_size, _config.min_buffer_size);
         }
+        auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+        bytes_received[sg_id] += b.size();
         return b;
     });
 }
@@ -671,12 +676,16 @@ std::vector<iovec> to_iovec(std::vector<temporary_buffer<char>>& buf_vec) {
 
 future<>
 posix_data_sink_impl::put(temporary_buffer<char> buf) {
+    auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+    bytes_sent[sg_id] += buf.size();
     return _fd.write_all(buf.get(), buf.size()).then([d = buf.release()] {});
 }
 
 future<>
 posix_data_sink_impl::put(packet p) {
     _p = std::move(p);
+    auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+    bytes_sent[sg_id] += _p.len();
     return _fd.write_all(_p).then([this] { _p.reset(); });
 }
 
@@ -867,7 +876,7 @@ public:
     }
     virtual bool is_closed() const override { return _closed; }
     socket_address local_address() const override {
-        assert(_address.u.sas.ss_family != AF_INET6 || (_address.addr_length > 20));
+        SEASTAR_ASSERT(_address.u.sas.ss_family != AF_INET6 || (_address.addr_length > 20));
         return _address;
     }
 };
@@ -876,15 +885,19 @@ future<> posix_datagram_channel::send(const socket_address& dst, const char *mes
     auto len = strlen(message);
     auto a = dst;
     resolve_outgoing_address(a);
+    auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+    bytes_sent[sg_id] += len;
     return _fd.sendto(a, message, len)
-            .then([len] (size_t size) { assert(size == len); });
+            .then([len] (size_t size) { SEASTAR_ASSERT(size == len); });
 }
 
 future<> posix_datagram_channel::send(const socket_address& dst, packet p) {
     auto len = p.len();
     _send.prepare(dst, std::move(p));
+    auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+    bytes_sent[sg_id] += len;
     return _fd.sendmsg(&_send._hdr)
-            .then([len] (size_t size) { assert(size == len); });
+            .then([len] (size_t size) { SEASTAR_ASSERT(size == len); });
 }
 
 udp_channel
@@ -954,6 +967,8 @@ posix_datagram_channel::receive() {
                 break;
             }
         }
+        auto sg_id = internal::scheduling_group_index(current_scheduling_group());
+        bytes_received[sg_id] += size;
         return make_ready_future<datagram>(datagram(std::make_unique<posix_datagram>(
             _recv._src_addr, dst ? *dst : _address, packet(fragment{_recv._buffer, size}, make_deleter([buf = _recv._buffer] { delete[] buf; })))));
     }).handle_exception([p = _recv._buffer](auto ep) {
@@ -1197,6 +1212,18 @@ std::vector<network_interface> posix_network_stack::network_interfaces() {
     }();
 
     return std::vector<network_interface>(thread_local_interfaces.begin(), thread_local_interfaces.end());
+}
+
+statistics posix_network_stack::stats(unsigned scheduling_group_id) {
+    return statistics{
+        bytes_sent[scheduling_group_id],
+        bytes_received[scheduling_group_id],
+    };
+}
+
+void posix_network_stack::clear_stats(unsigned scheduling_group_id) {
+    bytes_sent[scheduling_group_id] = 0;
+    bytes_received[scheduling_group_id] = 0;
 }
 
 }

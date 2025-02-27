@@ -26,6 +26,7 @@
 #include <boost/lexical_cast.hpp>
 
 #include <ostream>
+#include <seastar/util/assert.hh>
 #include <seastar/util/std-compat.hh>
 #include <seastar/net/inet_address.hh>
 
@@ -597,11 +598,14 @@ dns_resolver::impl::end_call() {
     }
 }
 
+#define USE_CARES_EVENTFD (ARES_VERSION >= 0x012200)
+
 void
 dns_resolver::impl::poll_sockets() {
     dns_log.trace("Poll sockets");
 
     bool processed = false;
+
     for (;;) {
         // Retrieve the set of file descriptors that the library wants us to monitor.
         fd_set readers, writers;
@@ -614,9 +618,17 @@ dns_resolver::impl::poll_sockets() {
             break;
         }
 
+#if USE_CARES_EVENTFD
+        // avoid allocations on every poll. the ares_process_fds will not reenter this,
+        // as any read/write/close callbacks will either complete or create a pending
+        // future which cannot execute until the call returns.
+        // I.e. we cannot get here while this call is running, so safe to make this
+        // thread static
+        static thread_local ares_fd_events_t events[FD_SETSIZE];
+#endif
         int processed_fds = 0;
-        for (auto it = _sockets.begin(); it != _sockets.end();) {
-            auto& [fd, e] = *it++;
+
+        for (auto& [fd, e] : _sockets) {
             bool read_monitor = FD_ISSET(fd, &readers);
             bool write_monitor = FD_ISSET(fd, &writers);
             bool read_avail = e.avail & POLLIN;
@@ -628,20 +640,61 @@ dns_resolver::impl::poll_sockets() {
                           read_avail ? "r" : "",
                           write_avail ? "w" : "");
 
-            ares_socket_t read_fd = read_monitor && read_avail ? fd : ARES_SOCKET_BAD;
-            ares_socket_t write_fd = write_monitor && write_avail ? fd : ARES_SOCKET_BAD;
-            if (read_fd != ARES_SOCKET_BAD || write_fd != ARES_SOCKET_BAD) {
-                ares_process_fd(_channel, read_fd, write_fd);
+            // #2641 - don't do callbacks per fd, instead use 
+            // ares_process or ares_process_fds if available.
+            // Use ares_process_fds if possible, since this
+            // is the recommended api, and will avoid a bunch
+            // of allocation etc.
+            // We are still tied to FD_SET bounds in the use of ares_fds.
+            // Once we no longer support pre-1.34 c-ares, move to use
+            // socket state callbacks.
+
+            // clear fd state
+#if USE_CARES_EVENTFD
+            events[processed_fds] = {0,};
+            // Update read/write state based on our poll info
+            if (read_monitor && read_avail) {
+                events[processed_fds].fd = fd;
+                events[processed_fds].events |= ARES_FD_EVENT_READ;
+            }
+            if (write_monitor && write_avail) {
+                events[processed_fds].fd = fd;
+                events[processed_fds].events |= ARES_FD_EVENT_WRITE;
+            }
+            if (events[processed_fds].events) {
                 ++processed_fds;
             }
+#else
+            FD_CLR(fd, &readers);
+            FD_CLR(fd, &writers);
+            // Update read/write state based on our poll info
+            if (read_monitor && read_avail) {
+                FD_SET(fd, &readers);
+            }
+            if (write_monitor && write_avail) {
+                FD_SET(fd, &writers);
+            }
+            if (FD_ISSET(fd, &readers) || FD_ISSET(fd, &writers)) {
+                ++processed_fds;
+            }
+#endif
         }
+        // no sockets of interest had polling values. done.
         if (processed_fds == 0) {
-          break;
+            break;
         }
+        // call fd processing. this will clean up and close sockets as well.
+#if USE_CARES_EVENTFD
+        ares_process_fds(_channel, events, processed_fds, ARES_PROCESS_FLAG_NONE);
+#else
+        ares_process(_channel, &readers, &writers);
+#endif
         processed = true;
     }
+    // even if we did not process anything, do a single callback to maybe close
+    // broken sockets.
     if (!processed) {
-      ares_process_fd(_channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
+        ares_process_fd(_channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
     }
 }
 
@@ -703,11 +756,11 @@ dns_resolver::impl::make_hostent(const ::hostent& host) {
     while (*p != nullptr) {
         switch (host.h_addrtype) {
         case AF_INET:
-            assert(size_t(host.h_length) >= sizeof(in_addr));
+            SEASTAR_ASSERT(size_t(host.h_length) >= sizeof(in_addr));
             e.addr_list.emplace_back(*reinterpret_cast<const in_addr*>(*p));
             break;
         case AF_INET6:
-            assert(size_t(host.h_length) >= sizeof(in6_addr));
+            SEASTAR_ASSERT(size_t(host.h_length) >= sizeof(in6_addr));
             e.addr_list.emplace_back(*reinterpret_cast<const in6_addr*>(*p));
             break;
         default:
@@ -825,7 +878,7 @@ dns_resolver::impl::do_connect(ares_socket_t fd, const sockaddr * addr, socklen_
 
         dns_log.trace("Connect {}({})->{}", fd, int(e.typ), sa);
 
-        assert(e.avail == 0);
+        SEASTAR_ASSERT(e.avail == 0);
 
         e.avail = POLLOUT|POLLIN; // until we know otherwise
 

@@ -282,10 +282,6 @@ option (Seastar_INSTALL
   "Install targets."
   ${Seastar_MASTER_PROJECT})
 
-option (Seastar_NUMA
-  "Enable NUMA support."
-  ON)
-
 option (Seastar_TESTING
   "Enable testing targets."
   ${Seastar_MASTER_PROJECT})
@@ -688,6 +684,7 @@ add_library (seastar
   include/seastar/util/closeable.hh
   include/seastar/util/source_location-compat.hh
   include/seastar/util/short_streams.hh
+  include/seastar/websocket/common.hh
   include/seastar/websocket/server.hh
   src/core/alien.cc
   src/core/file.cc
@@ -777,6 +774,8 @@ add_library (seastar
   src/util/read_first_line.cc
   src/util/tmp_file.cc
   src/util/short_streams.cc
+  src/websocket/parser.cc
+  src/websocket/common.cc
   src/websocket/server.cc
   )
 
@@ -799,7 +798,6 @@ target_include_directories (seastar
 
 set (Seastar_PRIVATE_CXX_FLAGS
   -fno-semantic-interposition
-  -UNDEBUG
   -Wall
   -Werror
   -Wimplicit-fallthrough
@@ -901,11 +899,6 @@ endif ()
 set( MEMORYCHECK_COMMAND_OPTIONS "--error-exitcode=1 --leak-check=no --trace-children=yes" )
 include (CTest)
 
-#
-# We want asserts enabled on all modes, but cmake defaults to passing
-# -DNDEBUG in some modes. We add -UNDEBUG to our private options to
-# reenable it. To force asserts off pass -DNDEBUG in
-# Seastar_CXX_FLAGS.
 #
 # To disable -Werror, pass -Wno-error to Seastar_CXX_FLAGS.
 #
@@ -1047,13 +1040,6 @@ endif ()
 if (Seastar_LD_FLAGS)
   target_link_options (seastar
     PRIVATE ${Seastar_LD_FLAGS})
-endif ()
-
-if (Seastar_NUMA)
-  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_NUMA)
-
-  target_link_libraries (seastar
-    PRIVATE numactl::numactl)
 endif ()
 
 if (SystemTap-SDT_FOUND)
@@ -1410,7 +1396,6 @@ if (Seastar_INSTALL)
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findhwloc.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findlksctp-tools.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findlz4.cmake
-      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findnumactl.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findragel.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Findrt.cmake
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Finducontext.cmake

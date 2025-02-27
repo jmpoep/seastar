@@ -382,7 +382,7 @@ SEASTAR_THREAD_TEST_CASE(sg_key_constructor_exception_when_creating_new_key) {
         }
         ~thrower() {
             // Shouldn't get here because the constructor shouldn't succeed
-            BOOST_ASSERT(false);
+            SEASTAR_ASSERT(false);
         }
     };
     scheduling_group_key_config thrower_conf = make_scheduling_group_key_config<thrower>();
@@ -392,7 +392,8 @@ SEASTAR_THREAD_TEST_CASE(sg_key_constructor_exception_when_creating_new_key) {
 SEASTAR_THREAD_TEST_CASE(sg_create_with_destroy_tasks) {
     struct nada{};
 
-    engine().at_destroy([] {}); // nothing really
+    // at_destroy() functionality is deprecated, but test until removed.
+    internal::at_destroy([] {}); // nothing really
 
     scheduling_group_key_config sg_conf = make_scheduling_group_key_config<nada>();
     scheduling_group_key_create(sg_conf).get();

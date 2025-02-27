@@ -24,6 +24,7 @@ module;
 #endif
 
 #include <concepts>
+#include <gnutls/gnutls.h>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -194,7 +195,10 @@ void connection::shutdown() noexcept {
 }
 
 future<> connection::close() {
-    return when_all(_read_buf.close(), _write_buf.close()).discard_result().then([this] {
+    // #2661. At least output stream close can fail with exception, because
+    // the stream will do a flush. If connection never managed to send data, we
+    // will throw again here. Need to suppress these exceptions.
+    return when_all(_read_buf.close().handle_exception([](auto&&){}), _write_buf.close().handle_exception([](auto&&){})).discard_result().then([this] {
         auto la = _fd.local_address();
         return std::move(_closed).then([la = std::move(la)] {
             http_log.trace("destroyed connection {}", la);
@@ -341,8 +345,27 @@ future<> client::do_make_request(request& req, reply_handler& handle, abort_sour
             return make_exception_future<>(ex);
         }
 
-        auto code = ex.code().value();
-        if ((code != EPIPE) && (code != ECONNABORTED)) {
+        bool should_retry = false;
+        const std::exception* current_exception = &ex;
+        while (current_exception) {
+            if (auto sys_error = dynamic_cast<const std::system_error*>(current_exception)) {
+                auto code = sys_error->code().value();
+                if (code == EPIPE || code == ECONNABORTED || code == GNUTLS_E_PREMATURE_TERMINATION) {
+                    should_retry = true;
+                    break;
+                }
+            }
+            try {
+                std::rethrow_if_nested(*current_exception);
+            } catch (const std::exception& nested) {
+                current_exception = &nested;
+                continue;
+            } catch (...) {
+                break;
+            }
+            current_exception = nullptr;
+        }
+        if (!should_retry) {
             return make_exception_future<>(ex);
         }
 

@@ -62,7 +62,7 @@ future<> test_websocket_handshake_common(std::string subprotocol) {
                     });
                 });
             });
-        websocket::connection conn(dummy, acceptor.get().connection);
+        websocket::server_connection conn(dummy, acceptor.get().connection);
         future<> serve = conn.process();
         auto close = defer([&conn, &input, &output, &serve] () noexcept {
             conn.close().get();
@@ -80,7 +80,7 @@ future<> test_websocket_handshake_common(std::string subprotocol) {
         parser.init();
         input.consume(parser).get();
         std::unique_ptr<http::reply> resp = parser.get_parsed_response();
-        BOOST_ASSERT(resp);
+        SEASTAR_ASSERT(resp);
         sstring websocket_accept = resp->_headers["Sec-WebSocket-Accept"];
         // Trim possible whitespace prefix
         auto it = std::find_if(websocket_accept.begin(), websocket_accept.end(), ::isalnum);
@@ -132,7 +132,7 @@ future<> test_websocket_handler_registration_common(std::string subprotocol) {
                 });
             });
         });
-        websocket::connection conn(ws, acceptor.get().connection);
+        websocket::server_connection conn(ws, acceptor.get().connection);
         future<> serve = conn.process();
 
         auto close = defer([&conn, &input, &output, &serve] () noexcept {
@@ -234,11 +234,11 @@ SEASTAR_TEST_CASE(test_websocket_parser_split) {
                     break;
                 }
 
-                BOOST_ASSERT(parser.is_valid());
+                SEASTAR_ASSERT(parser.is_valid());
                 results.push_back(seastar::to_sstring(parser.result()));
             }
 
-            BOOST_ASSERT(!parser.is_valid());
+            SEASTAR_ASSERT(!parser.is_valid());
             BOOST_REQUIRE_EQUAL(0, parser.result().size());
 
             std::vector<sstring> expected = {
