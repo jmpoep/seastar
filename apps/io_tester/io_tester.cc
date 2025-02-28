@@ -33,6 +33,7 @@
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/io_intent.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/later.hh>
 #include <chrono>
 #include <optional>
@@ -640,7 +641,7 @@ private:
     void emit_one_metrics(YAML::Emitter& out, sstring m_name) {
         const auto& values = seastar::metrics::impl::get_value_map();
         const auto& mf = values.find(m_name);
-        assert(mf != values.end());
+        SEASTAR_ASSERT(mf != values.end());
         for (auto&& mi : mf->second) {
             auto&& cname = mi.first.labels().find("class");
             if (cname != mi.first.labels().end() && cname->second == name()) {
@@ -1174,7 +1175,7 @@ int main(int ac, char** av) {
             }
 
             ctx.start(storage, *st_type, reqs, duration).get();
-            engine().at_exit([&ctx] {
+            internal::at_exit([&ctx] {
                 return ctx.stop();
             });
             std::cout << "Creating initial files..." << std::endl;
